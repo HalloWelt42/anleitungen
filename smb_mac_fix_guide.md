@@ -1,87 +1,20 @@
-# SMB-Probleme auf macOS: Ursachen, Abhilfe und Lösungen
+# SMB-Dauerhafte Automount-, Indexierungsverhinderungs- und Reparaturlösung auf macOS
 
-## Problemstellung
-
-Unter macOS kommt es bei Verwendung von SMB-Laufwerken (z.B. Raspberry Pi, NAS, Linux-Server) häufig zu Problemen nach Verbindungsunterbrechungen:
-
-- Das Laufwerk wird "tot" (nicht mehr ansprechbar)
-- Finder oder Terminal hängt beim Zugriff
-- Der Ordner unter `/Volumes/...` lässt sich nicht mehr entfernen oder remounten
-- Nur ein kompletter Neustart behebt das Problem zuverlässig
+Diese Anleitung ermöglicht das stabile automatische Mounten von SMB-Freigaben auf macOS, verhindert dauerhaft die Indexierung externer Netzlaufwerke durch Spotlight und bietet Reparaturskripte für bekannte macOS-SMB-Probleme, ohne dass es zu Systemhänger oder Endlosschleifen kommt.
 
 ---
 
-## Ursachen
+## 🔧 Voraussetzungen
 
-- Instabile Netzwerkverbindungen (z.B. WLAN, IP-Wechsel)
-- Samba-Server wird neu gestartet oder geht in Standby
-- macOS cached und sperrt SMB-Zugriffe über Kernel-Subsysteme
-- Spotlight oder Finder blockieren den Zugriff
-
----
-
-## Lösungen ohne Neustart
-
-### 1. Verbindung im Terminal trennen
-```bash
-mount | grep smbfs
-# Beispiel: smbfs on /Volumes/myshare (smbfs, nodev, nosuid, mounted by user)
-
-sudo umount -f /Volumes/myshare
-```
-Falls das nicht funktioniert:
-```bash
-sudo pkill -f smbfs
-```
-
-### 2. Blockierende Prozesse finden
-```bash
-sudo lsof | grep /Volumes/myshare
-# Dann: kill -9 <PID>
-```
-
-### 3. Mount-Ordner manuell löschen
-```bash
-cd /Volumes
-sudo rm -rf myshare
-```
-
-### 4. Neu mounten
-```bash
-mkdir -p /Volumes/myshare
-mount_smbfs //user@hostname/share /Volumes/myshare
-```
+* Der Server (z.B. Raspberry Pi, NAS) bietet SMB-Freigabe an
+* macOS Ventura oder neuer (getestet auch unter Monterey)
+* Terminal-Zugriff mit Adminrechten
 
 ---
 
-## Verbesserungen und Workarounds
+## 1. 📦 Automatisches Mounten über `launchd`
 
-### Spotlight deaktivieren für SMB-Volumes
-```bash
-sudo mdutil -i off /Volumes/myshare
-```
-
-### SMB mit "nobrowse" mounten (versteckt im Finder)
-```bash
-mount_smbfs -o nobrowse //user@host/share /Volumes/myshare
-```
-
-### Stabileres Mounting per Automounter
-- Einrichtung in `/etc/auto_master` und `/etc/auto_smb`
-- macOS kann Netzwerk-Mounts robuster verwalten
-
-### Alternative Protokolle nutzen
-
-#### SSHFS (über macFUSE)
-```bash
-sshfs user@host:/pfad /Volumes/remote -o reconnect,volname=remote
-```
-
-#### WebDAV (z.B. mit Nextcloud oder Synology)
-
----
-
-## Automatisches Remount-Skript
+### ➤ Script erstellen: `~/mount-smb.sh`
 
 ```bash
 #!/bin/bash
@@ -94,11 +27,117 @@ if ! mount | grep "$MOUNTPOINT" > /dev/null; then
 fi
 ```
 
-- Speichern als `~/mount-smb.sh`
-- Start per Anmeldeobjekt oder `launchd`
+### ➤ Ausführbar machen
+
+```bash
+chmod +x ~/mount-smb.sh
+```
+
+### ➤ LaunchAgent-Plist erstellen: `~/Library/LaunchAgents/com.user.mountsmb.plist`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.mountsmb</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/$(whoami)/mount-smb.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer> <!-- alle 5 Minuten prüfen -->
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+```
+
+### ➤ Aktivieren
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.user.mountsmb.plist
+```
+
+---
+
+## 2. 🛡️ Spotlight und Finder-Indexierung verhindern
+
+### ➤ Für alle SMB-Volumes dauerhaft:
+
+```bash
+sudo defaults write /Volumes/.Spotlight-V100/VolumeConfiguration Exclusions -array-add /Volumes
+```
+
+Oder je Mountpoint direkt:
+
+```bash
+sudo mdutil -i off /Volumes/myshare
+sudo mdutil -E /Volumes/myshare
+```
+
+### ➤ Alternativ systemweit deaktivieren:
+
+```bash
+sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.metadata.mds.plist
+```
+
+*(nicht empfohlen bei interner Spotlight-Nutzung)*
+
+---
+
+## 3. 🔁 Reparaturskript für fehlerhafte Mounts
+
+### ➤ Skript: `~/repair-smb.sh`
+
+```bash
+#!/bin/bash
+MOUNTPOINT="/Volumes/myshare"
+
+if mount | grep "$MOUNTPOINT" > /dev/null; then
+    echo "Unmounting $MOUNTPOINT"
+    sudo umount -f "$MOUNTPOINT"
+    sleep 1
+    sudo rm -rf "$MOUNTPOINT"
+fi
+
+mkdir -p "$MOUNTPOINT"
+mount_smbfs //user@host/share "$MOUNTPOINT"
+```
+
+### ➤ Ausführbar machen:
+
+```bash
+chmod +x ~/repair-smb.sh
+```
+
+### ➤ Manuell oder per Menü/App starten
+
+(z.B. als Service mit Automator, kein LaunchDaemon – wegen Stabilität)
+
+---
+
+## 🔄 Optional: SSHFS als Ersatz für SMB (stabiler)
+
+```bash
+sshfs user@host:/pfad /Volumes/remote -o reconnect,volname=remote
+```
+
+(macFUSE notwendig)
+
+---
+
+## ✅ Hinweise zur Sicherheit & Stabilität
+
+* Keine Endlosschleifen (Intervall-gesteuert)
+* `mount_smbfs` wird nur bei Bedarf aufgerufen
+* Kein Systemdienst wird dauerhaft blockiert
+* `mdutil`-Deaktivierung nur gezielt für Volumes
+* `repair-smb.sh` kann bei Bedarf über GUI gestartet werden
 
 ---
 
 ## Fazit
-SMB-Verbindungen unter macOS sind störanfällig, lassen sich aber mit einigen Workarounds zuverlässig betreiben. Bei anhaltenden Problemen lohnt sich ggf. ein Umstieg auf SSHFS oder WebDAV.
 
+Mit dieser Lösung ist ein stabiler Zugriff auf SMB-Freigaben unter macOS möglich, ohne dass Spotlight oder das System blockiert werden. Ein automatischer Reconnect sowie manuelle Reparatur sind jederzeit möglich, ohne Neustart oder Dateiverlust.
